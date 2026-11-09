@@ -1,0 +1,176 @@
+# Post-estimation analyses for the selected 3-class covariate model
+suppressMessages(library(poLCA))
+R <- readRDS("/home/claude/stats2/models.rds"); M <- R$M; dat <- R$dat
+BL <- tryCatch(readRDS("/home/claude/stats2/blrt.rds"), error = function(e) NULL)
+P <- readRDS("/home/claude/stats2/prep.rds")
+stopifnot(identical(P$a$id, dat$id)); for (v in paste0("R", 1:10)) dat[[v]] <- P$a[[v]]
+out <- list()
+r2 <- function(x, d = 2) formatC(x, format = "f", digits = d)
+
+entropy <- function(m) { p <- m$posterior; C <- ncol(p); if (C == 1) return(NA)
+  1 - sum(-p * log(pmax(p, 1e-300))) / (nrow(p) * log(C)) }
+# number of empty-category parameters poLCA would have counted under the manuscript's coding
+# (I5 and I6 each skip one category on the 1-5 scale): each adds 1 parameter per class
+fitrow <- function(m, C, empty = 0) {
+  n <- m$Nobs; k <- m$npar; ll <- m$llik
+  k2 <- k + empty * C
+  sab <- function(k) -2 * ll + k * log((n + 2) / 24)
+  data.frame(C = C, LL = ll, k = k, AIC = -2 * ll + 2 * k, BIC = -2 * ll + k * log(n), SABIC = sab(k),
+             BIC_k_ms = -2 * ll + k2 * log(n), k_ms = k2,
+             entropy = entropy(m), smallest_n = min(table(factor(m$predclass, levels = 1:C))),
+             smallest_pct = 100 * min(table(factor(m$predclass, levels = 1:C))) / n,
+             rep = if (C == 1) NA else paste0(m$rep_count, "/", m$nrep))
+}
+fit_cov <- do.call(rbind, lapply(1:5, function(C) fitrow(M$cov[[C]], C, 1)))
+fit_unc <- do.call(rbind, lapply(1:5, function(C) fitrow(M$unc[[C]], C, 1)))
+fit_col <- do.call(rbind, lapply(1:5, function(C) fitrow(M$col[[C]], C, 0)))
+out$fit_cov <- fit_cov; out$fit_unc <- fit_unc; out$fit_col <- fit_col; out$BL <- BL
+print(fit_cov); print(fit_unc); print(fit_col); print(BL)
+
+# ---- final model, ordered high -> moderate -> low; refit with low-risk as reference (class 1 in poLCA)
+m3 <- M$cov[[3]]
+sev <- tapply(dat$mean_item, m3$predclass, mean)
+ord_desc <- order(sev, decreasing = TRUE)                 # high, moderate, low
+f_cov <- as.formula(paste0("cbind(", paste0("Y", 1:10, collapse = ","), ") ~ age10 + female + alone"))
+ps <- poLCA.reorder(m3$probs.start, c(ord_desc[3], ord_desc[1], ord_desc[2]))   # low, high, moderate
+mr <- poLCA(f_cov, dat, nclass = 3, probs.start = ps, nrep = 1, maxiter = 5000, verbose = FALSE)
+stopifnot(abs(mr$llik - m3$llik) < 1e-3)
+# poLCA class 1 = low, 2 = high, 3 = moderate  -> paper labels: 1 high, 2 moderate, 3 low
+lab <- c(3, 1, 2)[mr$predclass]
+dat$cls <- factor(lab, levels = 1:3, labels = c("High", "Moderate", "Low"))
+pp <- mr$posterior[, c(2, 3, 1)]
+out$avepp <- sapply(1:3, function(k) mean(pp[lab == k, k]))
+out$n <- table(dat$cls); out$pct <- 100 * prop.table(out$n)
+cat("\nClass sizes:\n"); print(out$n); print(round(out$pct, 1)); print(round(out$avepp, 3))
+cat("Entropy:", entropy(mr), "\n")
+
+# ---- covariate effects
+b <- mr$coeff                       # rows: intercept, age10, female, alone; cols: class2(high), class3(mod) vs class1(low)
+se <- mr$coeff.se
+V <- mr$coeff.V                     # order = as.vector(b)
+stopifnot(max(abs(sqrt(diag(V)) - as.vector(se))) < 1e-6)
+covtab <- data.frame()
+for (j in 2:4) {
+  idx <- c(j, j + nrow(b))
+  w <- as.numeric(t(b[j, ]) %*% solve(V[idx, idx]) %*% b[j, ])
+  covtab <- rbind(covtab, data.frame(cov = rownames(b)[j],
+    OR_high = exp(b[j, 1]), lo_high = exp(b[j, 1] - 1.96 * se[j, 1]), hi_high = exp(b[j, 1] + 1.96 * se[j, 1]),
+    OR_mod = exp(b[j, 2]), lo_mod = exp(b[j, 2] - 1.96 * se[j, 2]), hi_mod = exp(b[j, 2] + 1.96 * se[j, 2]),
+    wald = w, p = pchisq(w, 2, lower.tail = FALSE)))
+}
+out$covtab <- covtab; print(covtab, digits = 3)
+
+# ---- descriptives (Table 1)
+g <- dat$cls
+desc <- function(x) c(tot = sprintf("%.1f (%.1f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE)),
+  sapply(levels(g), function(l) sprintf("%.1f (%.1f)", mean(x[g == l], na.rm = TRUE), sd(x[g == l], na.rm = TRUE))))
+npct <- function(x) c(tot = sprintf("%d (%.1f)", sum(x, na.rm = TRUE), 100 * mean(x, na.rm = TRUE)),
+  sapply(levels(g), function(l) sprintf("%d (%.1f)", sum(x[g == l], na.rm = TRUE), 100 * mean(x[g == l], na.rm = TRUE))))
+kw <- function(x) kruskal.test(x ~ g)$p.value
+T1 <- rbind(
+  age = c(desc(dat$age), p = summary(aov(dat$age ~ g))[[1]][1, 5]),
+  age_kw = c(rep("", 4), p = kw(dat$age)),
+  age60 = c(npct(dat$age < 70), p = NA), age70 = c(npct(dat$age >= 70 & dat$age < 80), p = NA), age80 = c(npct(dat$age >= 80), p = NA),
+  female = c(npct(dat$female == 1), p = chisq.test(table(g, dat$female))$p.value),
+  alone = c(npct(dat$alone == 1), p = chisq.test(table(g, dat$alone))$p.value),
+  HKI = c(npct(dat$region == "Hong Kong Island"), p = NA), KLN = c(npct(dat$region == "Kowloon"), p = NA), NT = c(npct(dat$region == "New Territories"), p = NA),
+  sf_mean = c(sub("\\(", "(", sprintf("%s", desc(dat$mean_item))), p = kw(dat$mean_item)),
+  lsn = c(desc(dat$lsn), p = kw(dat$lsn)),
+  lsn12 = c(npct(dat$lsn < 12), p = chisq.test(table(g, dat$lsn < 12))$p.value),
+  tfi = c(desc(dat$tfi), p = kw(dat$tfi)),
+  phys = c(desc(dat$tfi_phys), p = kw(dat$tfi_phys)), psy = c(desc(dat$tfi_psy), p = kw(dat$tfi_psy)), soc = c(desc(dat$tfi_soc), p = kw(dat$tfi_soc)))
+sfm <- function(x) c(tot = sprintf("%.2f (%.2f)", mean(x), sd(x)), sapply(levels(g), function(l) sprintf("%.2f (%.2f)", mean(x[g == l]), sd(x[g == l]))))
+T1["sf_mean", 1:4] <- sfm(dat$mean_item)
+tf5 <- dat$tfi >= 5
+T1 <- rbind(T1, tfi5 = c(sprintf("%d/%d (%.1f)", sum(tf5, na.rm = TRUE), sum(!is.na(tf5)), 100 * mean(tf5, na.rm = TRUE)),
+  sapply(levels(g), function(l) { z <- tf5[g == l]; sprintf("%d/%d (%.1f)", sum(z, na.rm = TRUE), sum(!is.na(z)), 100 * mean(z, na.rm = TRUE)) }),
+  p = chisq.test(table(g, tf5))$p.value))
+out$T1 <- T1; print(T1, quote = FALSE)
+out$overall <- list(age = c(mean(dat$age), sd(dat$age), range(dat$age)), band = table(dat$band),
+                    lsn12 = sum(dat$lsn < 12), tfi_n = sum(!is.na(dat$tfi)), tfi5 = sum(tf5, na.rm = TRUE),
+                    tfi_avail = sapply(dat[, c("tfi", "tfi_phys", "tfi_psy", "tfi_soc")], function(x) sum(!is.na(x))))
+an <- summary(aov(dat$age ~ g))[[1]]; out$age_F <- c(F = an[1, 4], df1 = an[1, 1], df2 = an[2, 1], p = an[1, 5])
+out$age_H <- kruskal.test(dat$age ~ g)
+print(out$age_F); print(out$age_H)
+
+# ---- Table 3: domain/item scores
+eta <- function(H, n, k = 3) (H - k + 1) / (n - k)
+pw <- function(x) { pr <- list(c("High", "Moderate"), c("High", "Low"), c("Moderate", "Low"))
+  sapply(pr, function(p) min(1, 3 * wilcox.test(x[g == p[1]], x[g == p[2]], exact = FALSE)$p.value)) }
+dom <- list(GR_items1to3 = dat$GR3, GR_items1to2 = dat$GR2, SBA = dat$SBA, SR = dat$SR, SM = dat$SM, total = dat$total)
+T3d <- t(sapply(dom, function(x) { H <- kruskal.test(x ~ g)$statistic
+  c(sapply(levels(g), function(l) sprintf("%.2f (%.2f)", mean(x[g == l]), sd(x[g == l]))),
+    H = r2(H), eta2 = r2(eta(H, length(x))), p = format.pval(kruskal.test(x ~ g)$p.value, 3),
+    padj = paste(formatC(pw(x), format = "g", digits = 3), collapse = " / ")) }))
+T3i <- t(sapply(paste0("I", 1:10), function(v) { x <- dat[[v]]
+  sapply(levels(g), function(l) sprintf("%.2f [%.1f]", mean(x[g == l]), 100 * mean(x[g == l] >= 4))) }))
+out$T3d <- T3d; out$T3i <- T3i; print(T3d, quote = FALSE); print(T3i, quote = FALSE)
+
+# ---- wording check (Cohen's d)
+dd <- function(x, a1, a2) { x1 <- x[g == a1]; x2 <- x[g == a2]
+  sp <- sqrt(((length(x1) - 1) * var(x1) + (length(x2) - 1) * var(x2)) / (length(x1) + length(x2) - 2)); (mean(x1) - mean(x2)) / sp }
+out$wording <- rbind(neg = c(M_L = dd(dat$neg, "Moderate", "Low"), H_M = dd(dat$neg, "High", "Moderate"), H_L = dd(dat$neg, "High", "Low")),
+                     pos = c(M_L = dd(dat$pos, "Moderate", "Low"), H_M = dd(dat$pos, "High", "Moderate"), H_L = dd(dat$pos, "High", "Low")))
+print(round(out$wording, 2))
+
+# ---- Table 4: bands and pre-frail comparisons
+out$T4 <- table(dat$band, g); print(out$T4)
+pf <- dat$band == "Pre-frail"
+hi <- pf & g == "High"; rest <- pf & g != "High"
+out$pf <- list(
+  lsn_by = tapply(dat$lsn[pf], droplevels(g[pf]), function(x) sprintf("%.2f (%.2f)", mean(x), sd(x))),
+  tfi_by = tapply(dat$tfi[pf], droplevels(g[pf]), function(x) sprintf("%.2f (%.2f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))),
+  lsn = c(hi = mean(dat$lsn[hi]), rest = mean(dat$lsn[rest]), p = wilcox.test(dat$lsn[hi], dat$lsn[rest], exact = FALSE)$p.value),
+  tfi = c(hi = mean(dat$tfi[hi], na.rm = TRUE), rest = mean(dat$tfi[rest], na.rm = TRUE), p = wilcox.test(dat$tfi[hi], dat$tfi[rest], exact = FALSE)$p.value),
+  iso = c(hi = 100 * mean(dat$lsn[hi] < 12), rest = 100 * mean(dat$lsn[rest] < 12)),
+  n = c(sum(hi), sum(rest)))
+print(out$pf)
+
+# ---- external validation
+ext <- function(x) { H <- kruskal.test(x ~ g)$statistic; n <- sum(!is.na(x))
+  c(means = tapply(x, g, mean, na.rm = TRUE), H = H, eta2 = eta(H, n), p = kruskal.test(x ~ g)$p.value, padj_ML = pw(x)[3]) }
+out$ext <- rbind(lsn = ext(dat$lsn), tfi = ext(dat$tfi), phys = ext(dat$tfi_phys), psy = ext(dat$tfi_psy), soc = ext(dat$tfi_soc))
+print(round(out$ext, 3))
+
+# ---- reliability
+alpha <- function(X) { X <- X[complete.cases(X), ]; k <- ncol(X); k / (k - 1) * (1 - sum(apply(X, 2, var)) / var(rowSums(X))) }
+out$rel <- c(sf10 = alpha(dat[, paste0("I", 1:10)]), lsn = alpha(P$lsn_items), kr20_tfi = alpha(P$tfi_items))
+print(round(out$rel, 3))
+
+# ---- retest classification with fixed baseline parameters
+kappa_w <- function(x, y, w = c("none", "linear")) {
+  w <- match.arg(w); x <- factor(x, 1:3); y <- factor(y, 1:3); t <- table(x, y) / length(x)
+  W <- if (w == "none") 1 - diag(3) else abs(outer(1:3, 1:3, "-")) / 2
+  1 - sum(W * t) / sum(W * outer(rowSums(t), colSums(t))) }
+rt <- !is.na(dat$R1) & complete.cases(dat[, paste0("R", 1:10)])
+# map retest raw 1-5 scores onto baseline consecutive codes; unseen categories -> missing (NA)
+lev <- lapply(1:10, function(j) sort(unique(dat[[paste0("I", j)]])))
+Yr <- sapply(1:10, function(j) match(dat[[paste0("R", j)]], lev[[j]]))
+Xr <- cbind(1, dat$age10, dat$female, dat$alone)
+post_fixed <- function(m, Yr, X, drop6 = FALSE) {
+  C <- length(m$P); eta <- X %*% cbind(0, m$coeff); prior <- exp(eta) / rowSums(exp(eta))
+  L <- prior
+  for (j in 1:10) { if (drop6 && j == 6) next
+    for (c in 1:C) { pj <- m$probs[[j]][c, Yr[, j]]; pj[is.na(pj)] <- 1; L[, c] <- L[, c] * pj } }
+  L / rowSums(L) }
+labmap <- c(3, 1, 2)
+pr1 <- post_fixed(mr, Yr, Xr); r_cls <- labmap[apply(pr1, 1, which.max)]
+pr2 <- post_fixed(mr, Yr, Xr, drop6 = TRUE); r_cls2 <- labmap[apply(pr2, 1, which.max)]
+b_cls <- as.integer(dat$cls)
+rtab <- function(rc) list(n = sum(rt), agree = 100 * mean(b_cls[rt] == rc[rt]), kappa = kappa_w(b_cls[rt], rc[rt]),
+  wkappa = kappa_w(b_cls[rt], rc[rt], "linear"), tab = table(baseline = b_cls[rt], retest = rc[rt]))
+out$retest <- rtab(r_cls); out$retest_drop6 <- rtab(r_cls2)
+out$retest_unseen <- colSums(is.na(Yr[rt, ]))
+print(out$retest); print(out$retest_drop6); print(out$retest_unseen)
+
+# ---- sensitivity: unconditional 3-class vs covariate classification; collapsed 2-class vs final
+match_kappa <- function(a1, b1) { # best label permutation
+  perms <- list(c(1,2,3), c(1,3,2), c(2,1,3), c(2,3,1), c(3,1,2), c(3,2,1)); best <- NULL
+  for (p in perms) { bb <- p[b1]; ag <- mean(a1 == bb); if (is.null(best) || ag > best$ag) best <- list(ag = ag, k = kappa_w(a1, bb)) }
+  best }
+out$sens_unc <- match_kappa(b_cls, M$unc[[3]]$predclass)
+c2 <- M$col[[2]]$predclass
+out$sens_col <- table(final = dat$cls, collapsed2 = c2)
+print(out$sens_unc); print(out$sens_col)
+
+saveRDS(list(out = out, dat = dat), "/home/claude/stats2/results.rds")
